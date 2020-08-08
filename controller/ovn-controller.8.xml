@@ -516,6 +516,18 @@
         end-to-end latency in a large scale environment.  See
         <code>ovn-nbctl</code>(8) for more details.
       </dd>
+
+      <dt><code>reconnect</code></dt>
+      <dd>
+      <p>
+        Trigger a force reconnect to one specific remote in Open_vSwitch table
+        external_ids:ovn-remote.
+      </p>
+      <p>
+        This command is intended to use in the event of clustered SB DB has
+        unbalanced clients across the raft nodes.
+      </p>
+      </dd>
       </dl>
     </p>
 

@@ -56,6 +56,7 @@
 #include "lib/hash.h"
 #include "smap.h"
 #include "sset.h"
+#include "svec.h"
 #include "stream-ssl.h"
 #include "stream.h"
 #include "unixctl.h"
@@ -64,10 +65,12 @@
 #include "timer.h"
 #include "stopwatch.h"
 #include "lib/inc-proc-eng.h"
+#include "ovsdb-session.h"
 
 VLOG_DEFINE_THIS_MODULE(main);
 
 static unixctl_cb_func ovn_controller_exit;
+static unixctl_cb_func ovn_controller_reconnect;
 static unixctl_cb_func ct_zone_list;
 static unixctl_cb_func extend_table_list;
 static unixctl_cb_func inject_pkt;
@@ -93,6 +96,11 @@ struct pending_pkt {
     /* Setting 'conn' indicates that a request is pending. */
     struct unixctl_conn *conn;
     char *flow_s;
+};
+
+struct ovn_controller_reconnect {
+    struct svec remotes;
+    char *next_remote;
 };
 
 struct local_datapath *
@@ -488,7 +496,8 @@ get_ofctrl_probe_interval(struct ovsdb_idl *ovs_idl)
 static void
 update_sb_db(struct ovsdb_idl *ovs_idl, struct ovsdb_idl *ovnsb_idl,
              bool *monitor_all_p, bool *reset_ovnsb_idl_min_index,
-             bool *enable_lflow_cache)
+             bool *enable_lflow_cache,
+             struct ovn_controller_reconnect *reconnect)
 {
     const struct ovsrec_open_vswitch *cfg = ovsrec_open_vswitch_first(ovs_idl);
     if (!cfg) {
@@ -498,6 +507,20 @@ update_sb_db(struct ovsdb_idl *ovs_idl, struct ovsdb_idl *ovnsb_idl,
     /* Set remote based on user configuration. */
     const char *remote = smap_get(&cfg->external_ids, "ovn-remote");
     ovsdb_idl_set_remote(ovnsb_idl, remote, true);
+    if (reconnect) {
+        /* Update reconnect remotes based on user configuration. */
+        struct uuid cid = UUID_ZERO;
+        if (reconnect->next_remote){
+            free(reconnect->next_remote);
+            reconnect->next_remote = NULL;
+        }
+        if (!svec_is_empty(&reconnect->remotes)) {
+            svec_destroy(&reconnect->remotes);
+            svec_init(&reconnect->remotes);
+        }
+        ovsdb_session_parse_remote(remote, &reconnect->remotes, &cid);
+        svec_sort(&reconnect->remotes);
+    }
 
     /* Set probe interval, based on user configuration and the remote. */
     int default_interval = (remote && !stream_or_pstream_needs_probes(remote)
@@ -2143,6 +2166,7 @@ main(int argc, char *argv[])
     bool exiting;
     bool restart;
     struct ovn_controller_exit_args exit_args = {&exiting, &restart};
+    struct ovn_controller_reconnect reconnect = {SVEC_EMPTY_INITIALIZER, NULL};
     int retval;
 
     ovs_cmdl_proctitle_init(argc, argv);
@@ -2161,6 +2185,8 @@ main(int argc, char *argv[])
     }
     unixctl_command_register("exit", "", 0, 1, ovn_controller_exit,
                              &exit_args);
+    unixctl_command_register("reconnect", "", 1, 1, ovn_controller_reconnect,
+                             &reconnect);
 
     daemonize_complete();
 
@@ -2457,7 +2483,7 @@ main(int argc, char *argv[])
 
         update_sb_db(ovs_idl_loop.idl, ovnsb_idl_loop.idl, &sb_monitor_all,
                      &reset_ovnsb_idl_min_index,
-                     &ctrl_engine_ctx.enable_lflow_cache);
+                     &ctrl_engine_ctx.enable_lflow_cache, &reconnect);
         update_ssl_config(ovsrec_ssl_table_get(ovs_idl_loop.idl));
         ofctrl_set_probe_interval(get_ofctrl_probe_interval(ovs_idl_loop.idl));
 
@@ -2608,8 +2634,14 @@ main(int argc, char *argv[])
                                                sb_monitor_all);
                         }
                     }
+                    if (reconnect.next_remote && ovsdb_idl_is_connected(ovnsb_idl_loop.idl)) {
+                        VLOG_INFO("User triggered force reconnect to %s", reconnect.next_remote);
+                        ovsdb_idl_set_next_remote(ovnsb_idl_loop.idl, reconnect.next_remote);
+                        ovsdb_idl_force_reconnect(ovnsb_idl_loop.idl);
+                        free(reconnect.next_remote);
+                        reconnect.next_remote = NULL;
+                    }
                 }
-
             }
 
             if (!engine_has_run()) {
@@ -2723,7 +2755,7 @@ loop_done:
         bool done = !ovsdb_idl_has_ever_connected(ovnsb_idl_loop.idl);
         while (!done) {
             update_sb_db(ovs_idl_loop.idl, ovnsb_idl_loop.idl,
-                         NULL, NULL, NULL);
+                         NULL, NULL, NULL, NULL);
             update_ssl_config(ovsrec_ssl_table_get(ovs_idl_loop.idl));
 
             struct ovsdb_idl_txn *ovs_idl_txn
@@ -2780,6 +2812,10 @@ loop_done:
     ovsdb_idl_loop_destroy(&ovnsb_idl_loop);
 
     free(ovs_remote);
+    if (!svec_is_empty(&reconnect.remotes)) {
+        svec_destroy(&reconnect.remotes);
+    }
+    free(reconnect.next_remote);
     service_stop();
 
     exit(retval);
@@ -2883,6 +2919,23 @@ ovn_controller_exit(struct unixctl_conn *conn, int argc,
     struct ovn_controller_exit_args *exit_args = exit_args_;
     *exit_args->exiting = true;
     *exit_args->restart = argc == 2 && !strcmp(argv[1], "--restart");
+    unixctl_command_reply(conn, NULL);
+}
+
+static void
+ovn_controller_reconnect(struct unixctl_conn *conn, int argc OVS_UNUSED,
+             const char *argv[], void *reconnect_args_)
+{
+    struct ovn_controller_reconnect *reconnect_args = reconnect_args_;
+    if (reconnect_args->next_remote) {
+        unixctl_command_reply_error(conn, "previous reconnect still in processing");
+        return;
+    }
+    if (!svec_contains(&reconnect_args->remotes, argv[1])) {
+        unixctl_command_reply_error(conn, "invalid remote");
+        return;
+    }
+    reconnect_args->next_remote = xstrdup(argv[1]);
     unixctl_command_reply(conn, NULL);
 }
 
